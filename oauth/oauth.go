@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -235,9 +236,14 @@ func (s *SupabaseMCPOAuthServer) handleUsernamePasswordLogin(w http.ResponseWrit
 	json.NewEncoder(w).Encode(response)
 }
 
+//go:embed login.html
+var loginHTML embed.FS
+
 func (s *SupabaseMCPOAuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		http.ServeFile(w, r, "oauth/login.html")
+		// http.ServeContent(w, r, "login.html", time.Now(), strings.NewReader(loginHTML))
+		// INSERT_YOUR_CODE
+		http.ServeFileFS(w, r, loginHTML, "login.html")
 		return
 	}
 	if r.Method != "POST" {
