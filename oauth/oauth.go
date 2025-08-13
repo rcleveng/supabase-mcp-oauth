@@ -1,17 +1,19 @@
 package oauth
 
 import (
+	"crypto/rand"
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/rcleveng/supabase-mcp-oauth/oauth/wellknown"
+	"github.com/rcleveng/supabase-mcp-oauth/oauth/wrappedjwt"
 
 	"github.com/supabase-community/auth-go"
 	"github.com/supabase-community/auth-go/types"
@@ -25,11 +27,14 @@ type SupabaseMCPOAuthServer struct {
 	authClient     auth.Client
 	clientRegistry *OAuthClientRegistry
 	wellknown      *wellknown.WellknownServer
+	keyManager     *wrappedjwt.KeyManager
+	codes          *CodeServer
 }
 
 // NewRegistry creates a new in-memory registry. baseURL should be the externally reachable
 // base URL of this service (e.g. http://localhost:8080) and is used to build registration_client_uri values.
-func NewSupabaseMCPOAuthServer(baseURL string, mcpResource string, supabaseURL string, supabaseKey string) (*SupabaseMCPOAuthServer, error) {
+func NewSupabaseMCPOAuthServer(baseURL string, mcpResource string, supabaseURL string, supabaseKey string, keyManager *wrappedjwt.KeyManager) (*SupabaseMCPOAuthServer, error) {
+	// TODO - If we need another parameter, switch to options pattern
 	parsedBaseURL, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid baseURL: %w", err)
@@ -48,13 +53,19 @@ func NewSupabaseMCPOAuthServer(baseURL string, mcpResource string, supabaseURL s
 
 	projectRef := strings.Split(strings.Split(supabaseURL, "://")[1], ".")[0]
 	authClient := auth.New(projectRef, supabaseKey)
+	codes, err := NewCodeServer("memory", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create code server: %w", err)
+	}
 	return &SupabaseMCPOAuthServer{
 		baseURL:        baseURL,
 		supabaseURL:    supabaseURL,
 		supabaseKey:    supabaseKey,
 		authClient:     authClient,
 		clientRegistry: NewOAuthClientRegistry(baseURL),
-		wellknown:      wellknown.NewWellknownServer(baseURL, mcpResource),
+		wellknown:      wellknown.NewWellknownServer(baseURL, mcpResource, keyManager),
+		keyManager:     keyManager,
+		codes:          codes,
 	}, nil
 }
 
@@ -65,6 +76,7 @@ func (s *SupabaseMCPOAuthServer) handleOAuthLogin(w http.ResponseWriter, r *http
 		http.Error(w, "client_id is required", http.StatusBadRequest)
 		return
 	}
+	// Use the Supabase auth client flow here to authorize the user.
 	providerData, err := authClient.Authorize(types.AuthorizeRequest{
 		Provider:   provider,
 		RedirectTo: s.baseURL + "/callback?state=" + string(provider) + "&" + r.URL.RawQuery,
@@ -72,8 +84,8 @@ func (s *SupabaseMCPOAuthServer) handleOAuthLogin(w http.ResponseWriter, r *http
 		FlowType:   types.FlowPKCE,
 	})
 	if err != nil {
-		slog.Error("handleOAuthLogin: Error signing in with Google", "url", r.URL.String(), "error", err)
-		http.Error(w, fmt.Sprintf("Error signing in with Google: %s", err), http.StatusInternalServerError)
+		slog.Error("handleOAuthLogin: Error authorizing with provider", "url", r.URL.String(), "error", err, "provider", string(provider))
+		http.Error(w, fmt.Sprintf("Error authorizing with provider: %s", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -135,6 +147,8 @@ func (s *SupabaseMCPOAuthServer) handleCallback(w http.ResponseWriter, r *http.R
 	// log request
 	slog.Debug("handleCallback: Received request", "method", r.Method, "code", code, "provider", provider, "codeVerifier", codeVerifier)
 
+	// TODO - Either don't exchange the code here, or store it in the database along with a
+	// new code we give to the client that is bound with the client id.
 	details, err := s.authClient.Token(types.TokenRequest{
 		GrantType:    "pkce",
 		Code:         code,
@@ -159,6 +173,27 @@ func (s *SupabaseMCPOAuthServer) handleCallback(w http.ResponseWriter, r *http.R
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
+
+	// register the code with the code server
+	clientCode := rand.Text()
+	err = s.codes.RegisterCode(Code{
+		ID:           clientCode,
+		Code:         code,
+		ClientID:     r.URL.Query().Get("client_id"),
+		CodeVerifier: codeVerifier,
+		ExpiresAt:    time.Now().Add(10 * time.Minute),
+		AccessToken:  details.AccessToken,
+		RefreshToken: details.RefreshToken,
+		UserID:       details.User.ID.String(),
+		Email:        details.User.Email,
+	})
+	if err != nil {
+		slog.Error("handleCallback: Error registering code", "url", r.URL.String(), "error", err)
+		http.Error(w, fmt.Sprintf("Error registering code: %s", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Send redirect to the client.
 	params := redirectUrl.Query()
 	params.Add("response_type", "code")
 	client_id := r.URL.Query().Get("client_id")
@@ -167,7 +202,8 @@ func (s *SupabaseMCPOAuthServer) handleCallback(w http.ResponseWriter, r *http.R
 	params.Add("code_challenge", r.URL.Query().Get("code_challenge"))
 	params.Add("code_challenge_method", r.URL.Query().Get("code_challenge_method"))
 	params.Add("state", r.URL.Query().Get("state"))
-	params.Add("code", "CHANGEME-"+client_id)
+	// be sure to send the client code and not the code from the provider.
+	params.Add("code", clientCode)
 	redirectUrl.RawQuery = params.Encode()
 	slog.Debug("handleCallback: Redirecting to", "url", r.URL.String(), "redirectUrl", redirectUrl.String())
 	http.Redirect(w, r, redirectUrl.String(), http.StatusSeeOther)
@@ -183,7 +219,6 @@ func (s *SupabaseMCPOAuthServer) RegisterHTTP(mux *http.ServeMux) {
 
 	s.clientRegistry.RegisterHTTP(mux)
 	s.wellknown.RegisterHTTP(mux)
-
 }
 
 func (s *SupabaseMCPOAuthServer) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -192,21 +227,85 @@ func (s *SupabaseMCPOAuthServer) handleToken(w http.ResponseWriter, r *http.Requ
 	// LOG request
 	slog.Debug("handleToken: Received request", "method", r.Method, "url", r.URL.String())
 	// print request body if POST
-	if r.Method == "POST" {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Error reading request body", http.StatusInternalServerError)
-			return
-		}
-		slog.Debug("handleToken: Request body", "url", r.URL.String(), "body", string(body))
+	if r.Method != "POST" {
+		slog.Error("handleToken: Method not allowed", "url", r.URL.String(), "method", r.Method)
+		http.Error(w, "Method not allowed: "+r.Method, http.StatusMethodNotAllowed)
+		return
 	}
+	// Get form data
+	if grant_type := r.FormValue("grant_type"); grant_type != "authorization_code" {
+		slog.Error("handleToken: grant_type must be authorization_code", "url", r.URL.String(), "grant_type", grant_type)
+		http.Error(w, "grant_type must be authorization_code", http.StatusBadRequest)
+		return
+	}
+	code := r.FormValue("code")
+	if code == "" {
+		slog.Error("handleToken: code is required", "url", r.URL.String())
+		http.Error(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	clientID := r.FormValue("client_id")
+	if clientID == "" {
+		slog.Error("handleToken: client_id is required", "url", r.URL.String())
+		http.Error(w, "client_id is required", http.StatusBadRequest)
+		return
+	}
+	codeVerifier := r.FormValue("code_verifier")
+	if codeVerifier == "" {
+		slog.Error("handleToken: code_verifier is required", "url", r.URL.String())
+		http.Error(w, "code_verifier is required", http.StatusBadRequest)
+		return
+	}
+	redirectURI := r.FormValue("redirect_uri")
+	if redirectURI == "" {
+		slog.Error("handleToken: redirect_uri is required", "url", r.URL.String())
+		http.Error(w, "redirect_uri is required", http.StatusBadRequest)
+		return
+	}
+
+	codeDetails, err := s.codes.FindCode(code, clientID, codeVerifier)
+	if err != nil {
+		slog.Error("handleToken: Error finding code", "url", r.URL.String(), "error", err)
+		http.Error(w, fmt.Sprintf("Error finding code: %s", err), http.StatusInternalServerError)
+		return
+	}
+
+	wrapper := wrappedjwt.NewUpstreamTokenWrapper(s.keyManager)
+	wrappedAccessToken, err := wrapper.Wrap(wrappedjwt.WrapRequest{
+		Token: codeDetails.AccessToken,
+		Issuer:           s.baseURL,
+		Subject:          codeDetails.UserID,
+		Audience:         clientID,
+		AdditionalClaims: map[string]any{},
+	})
+	if err != nil {
+		fmt.Println("Error wrapping access token", err)
+		slog.Error("handleToken: Error wrapping access token", "url", r.URL.String(), "error", err)
+		http.Error(w, fmt.Sprintf("Error wrapping access token: %s", err), http.StatusInternalServerError)
+		return
+	}
+	wrappedRefreshToken, err := wrapper.Wrap(wrappedjwt.WrapRequest{
+		Token: codeDetails.RefreshToken,
+		Issuer:           s.baseURL,
+		Subject:          codeDetails.UserID,
+		Audience:         clientID,
+		AdditionalClaims: map[string]any{},
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error wrapping refresh token: %s", err), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"access_token":  "CHANGEME-access_token",
-		"refresh_token": "CHANGEME-refresh_token",
+	json.NewEncoder(w).Encode(map[string]any{
+		"access_token":  wrappedAccessToken,
+		"refresh_token": wrappedRefreshToken,
 		"token_type":    "Bearer",
 		"expires_in":    3600,
 	})
+
+	// redirect to the redirectURI
+	http.Redirect(w, r, redirectURI, http.StatusSeeOther)
 }
 
 func (s *SupabaseMCPOAuthServer) handleUsernamePasswordLogin(w http.ResponseWriter, r *http.Request) {

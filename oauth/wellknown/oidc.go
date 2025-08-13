@@ -205,3 +205,4 @@ func (s *WellknownServer) HandleOidcDiscovery(w http.ResponseWriter, r *http.Req
 		CodeChallengeMethodsSupported:     []string{"S256"},
 	})
 }
+

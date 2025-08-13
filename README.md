@@ -108,7 +108,11 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Create the MCP OAuth server and register the endpoints.
-	oauthServer, err := oauth.NewSupabaseMCPOAuthServer(*serverURL, *mcpResource, *supabaseURL, *supabaseKey)
+	keyManager, err := wrappedjwt.NewKeyManager("memory", "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	oauthServer, err := oauth.NewSupabaseMCPOAuthServer(*serverURL, *mcpResource, *supabaseURL, *supabaseKey, keymanager)
 	if err != nil {
 		log.Fatal(err)
 	}
